@@ -29,8 +29,25 @@ typedef struct H264VideotoolboxContext {
     int64_t pts;
     int64_t dts;
     int64_t reordered_opaque;
+    int64_t duration;
 
 } H264VideotoolboxContext;
+
+
+typedef struct NALU {
+    int nalu_type;
+    int nalu_size;
+    int nalu_delimeter_size;
+    bool incomplete; //for avc only can detect
+    uint8_t* nalu_ptr;
+    uint8_t* nalu_data_ptr;
+    struct NALU *next;
+} NALU;
+
+
+static void build_nalu_list(H264VideotoolboxContext *context, const uint8_t* frame_start, NALU *first_nalu) {
+
+}
 
 
 static void parse_avc_type(H264VideotoolboxContext *context, const uint8_t* frameStart) {
@@ -141,6 +158,11 @@ static bool nalu_is_decodable(H264VideotoolboxContext *context, const uint8_t * 
     return nalu_type == 5 || nalu_type == 1;
 }
 
+
+static bool nalu_is_last(H264VideotoolboxContext *context, const uint8_t * nalu, const int max_length) {
+    return false;//TODO
+}
+
 //size without lenggth header/delimeter
 static int get_nalu_size(H264VideotoolboxContext *context, const uint8_t * nalu, const int max_length) {
     if (context->is_avc) {
@@ -155,7 +177,7 @@ static int get_nalu_size(H264VideotoolboxContext *context, const uint8_t * nalu,
         is_annexb_nalu(nalu, &annexb_delimeter_size);
 
         for (int i = annexb_delimeter_size; i < max_length - annexb_delimeter_size; i++) {
-            if (is_annexb_nalu(nalu + i, NULL)) {
+            if (is_annexb_nalu(nalu + i, NULL)) { //TODO: mb nalu[i] == 0 && nalu[i + 1] == 0 && (nalu[i + 2] == 1 || (nalu[i + 2] == 0 && nalu[i + 3] == 1))
                 return i - annexb_delimeter_size;
             }
         }    
@@ -235,6 +257,7 @@ static void decompressionSessionDecodeFrameCallback(void *decompressionOutputRef
         //here is output: deompressed frame picture
         context->pixbuf = CVPixelBufferRetain(imageBuffer);
         context->pts = presentationTimeStamp.value;
+        context->duration = presentationDuration.value;
 
         av_log(avctx, AV_LOG_INFO, "Decompressed PTS:%lld\n", presentationTimeStamp.value);
     }
@@ -583,21 +606,28 @@ static int h264_videotoolbox_decode_frame(AVCodecContext *avctx, void *outdata,
     copy_cvpixelbuffer(avctx, context->pixbuf, avframe);
     CVPixelBufferRelease(context->pixbuf);
 
-    //avframe->pts = avpkt->pts;
-    avframe->pts = context->pts;
-    avframe->reordered_opaque = context->pts;
-    avframe->pkt_dts = AV_NOPTS_VALUE;
+    av_log(avctx, AV_LOG_INFO, "avctx->reordered_opaque %lld\n", avctx->reordered_opaque);
+    av_log(avctx, AV_LOG_INFO, "avpkt->pts %lld\n", avpkt->pts);
+    av_log(avctx, AV_LOG_INFO, "avpkt->dts %lld\n", avpkt->dts);
+    av_log(avctx, AV_LOG_INFO, "avpkt->duration %lld\n", avpkt->duration);
+
+    //avframe->pkt_dts = AV_NOPTS_VALUE;
+    avframe->pts = avpkt->pts;
+ //   avframe->pts = context->pts;
+    avframe->reordered_opaque = avpkt->pts;
+    //avframe->pkt_duration = context->duration;
+    avframe->pkt_dts = context->dts;
 
     //   avframe->pts     = avpkt->pts; // can be different if we are returning some earlier frame
     //   avframe->pkt_dts = AV_NOPTS_VALUE;
-    //   avframe->reordered_opaque = avctx->reordered_opaque;
+   //    avframe->reordered_opaque = avctx->reordered_opaque;
 
      // I don't know why this thing is needed:
-//  #if FF_API_PKT_PTS
-//  FF_DISABLE_DEPRECATION_WARNINGS
-//      avframe->pkt_pts = avpkt->pts;
-//  FF_ENABLE_DEPRECATION_WARNINGS
-//  #endif
+ #if FF_API_PKT_PTS
+ FF_DISABLE_DEPRECATION_WARNINGS
+     avframe->pkt_pts = avpkt->pts;
+ FF_ENABLE_DEPRECATION_WARNINGS
+ #endif
 
     av_log(avctx, AV_LOG_INFO, "~~~~~~~Frame decoded~~~~~~~~\n\n");
 
