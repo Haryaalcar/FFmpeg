@@ -8,30 +8,16 @@
 
 #include "avcodec.h"
 #include "internal.h"
+#include <sys/queue.h>
 
 
-typedef struct H264VideotoolboxContext {
-    CMVideoFormatDescriptionRef formatDescription;
-    VTDecompressionSessionRef decompressionSession;
-
+typedef struct DecodedFrame {
     CVPixelBufferRef pixbuf;
-
-    bool avc_type_parsed;
-    bool is_avc; //avc means not annex b
-    int nalu_length_size; //from extradata, does not apply to annex b delimeter size
-
-    int sps_size;
-    int pps_size;
-
-    uint8_t* sps;
-    uint8_t* pps;
-
     int64_t pts;
-    int64_t dts;
-    int64_t reordered_opaque;
     int64_t duration;
 
-} H264VideotoolboxContext;
+    TAILQ_ENTRY(DecodedFrame) entries;
+} DecodedFrame;
 
 
 typedef struct NALU {
@@ -44,6 +30,86 @@ typedef struct NALU {
     const uint8_t* data_ptr;
     struct NALU *next;
 } NALU;
+
+
+typedef struct H264VideotoolboxContext {
+    CMVideoFormatDescriptionRef formatDescription;
+    VTDecompressionSessionRef decompressionSession;
+
+    bool avc_type_parsed;
+    bool is_avc; //avc means not annex b
+    int nalu_length_size; //from extradata, does not apply to annex b delimeter size
+
+    int sps_size;
+    int pps_size;
+
+    uint8_t* sps;
+    uint8_t* pps;
+
+    CVPixelBufferRef pixbuf;
+    int64_t pts;
+    int64_t duration;
+    int nalu_count;
+
+    NALU *first_decodable_nalu;
+    TAILQ_HEAD(, DecodedFrame) decoded_frames;
+
+} H264VideotoolboxContext;
+
+
+static void add_decoded_frame_to_queue(H264VideotoolboxContext *context, CVPixelBufferRef pixbuf, int64_t pts, int64_t duration) {
+    //context->head
+    DecodedFrame *decoded_frame = (DecodedFrame *)malloc(sizeof(DecodedFrame));
+    if (decoded_frame) {
+        decoded_frame->pixbuf = CVPixelBufferRetain(pixbuf);
+        decoded_frame->pts = pts;
+        decoded_frame->duration = duration;
+    }
+
+    //av_log(NULL, AV_LOG_INFO, "\n");
+
+    TAILQ_INSERT_TAIL(&context->decoded_frames, decoded_frame, entries);
+}
+
+
+static void set_sps(H264VideotoolboxContext *context, const uint8_t* sps, int sps_size) {
+    if (context->sps) {
+        free(context->sps);
+        context->sps = 0;
+    }
+
+    if (sps && sps_size) {
+        context->sps_size = sps_size;
+        context->sps = malloc(sps_size);
+        memcpy(context->sps, sps, sps_size);
+    }
+}
+
+static void set_pps(H264VideotoolboxContext *context, const uint8_t* pps, int pps_size) {
+    if (context->pps) {
+        free(context->pps);
+        context->pps = 0;
+    }
+
+    if (pps && pps_size) {
+        context->pps_size = pps_size;
+        context->pps = malloc(pps_size);
+        memcpy(context->pps, pps, pps_size);
+    }
+}
+
+
+static void set_pixbuffer(H264VideotoolboxContext *context, CVPixelBufferRef pixbuf) {
+    if (context->pixbuf) {
+        CVPixelBufferRelease(context->pixbuf);
+        context->pixbuf = 0;
+    }
+    if (pixbuf) {
+        context->pixbuf = CVPixelBufferRetain(pixbuf);
+    }
+}
+
+
 
 static NALU * create_NALU(H264VideotoolboxContext *context, const uint8_t* frame, const int max_length) {
     NALU *nalu = (NALU *)malloc(sizeof(NALU));
@@ -139,33 +205,6 @@ static void parse_avc_type(H264VideotoolboxContext *context, const uint8_t* fram
 }
 
 
-static void set_sps(H264VideotoolboxContext *context, const uint8_t* sps, int sps_size) {
-    if (context->sps) {
-        free(context->sps);
-        context->sps = 0;
-    }
-
-    if (sps && sps_size) {
-        context->sps_size = sps_size;
-        context->sps = malloc(sps_size);
-        memcpy(context->sps, sps, sps_size);
-    }
-}
-
-static void set_pps(H264VideotoolboxContext *context, const uint8_t* pps, int pps_size) {
-    if (context->pps) {
-        free(context->pps);
-        context->pps = 0;
-    }
-
-    if (pps && pps_size) {
-        context->pps_size = pps_size;
-        context->pps = malloc(pps_size);
-        memcpy(context->pps, pps, pps_size);
-    }
-}
-
-
 static void create_format_description(AVCodecContext *avctx) {
     H264VideotoolboxContext *context = avctx->priv_data;
 
@@ -208,10 +247,10 @@ static void decompressionSessionDecodeFrameCallback(void *decompressionOutputRef
         CFRelease(error_description);
     }
     else {
-        av_log(avctx, AV_LOG_INFO, "Decompressed sucessfully\n");
+        av_log(avctx, AV_LOG_INFO, "Decompressed sucessfully, img %p\n", imageBuffer);
 
-        //here is output: deompressed frame picture
-        context->pixbuf = CVPixelBufferRetain(imageBuffer);
+        //add_decoded_frame_to_queue(context, CVPixelBufferRetain(imageBuffer), presentationTimeStamp.value, presentationDuration.value);
+        set_pixbuffer(context, imageBuffer);
         context->pts = presentationTimeStamp.value;
         context->duration = presentationDuration.value;
 
@@ -220,7 +259,7 @@ static void decompressionSessionDecodeFrameCallback(void *decompressionOutputRef
 }
 
 
-static void decompress(AVCodecContext *avctx, CMSampleBufferRef sampleBuffer) {
+static void decompress_sample_buffer(AVCodecContext *avctx, CMSampleBufferRef sampleBuffer) {
     H264VideotoolboxContext *context = avctx->priv_data;
     
     OSStatus status;
@@ -236,7 +275,6 @@ static void decompress(AVCodecContext *avctx, CMSampleBufferRef sampleBuffer) {
     if (status == noErr) {
         status = VTDecompressionSessionWaitForAsynchronousFrames(context->decompressionSession);
     }
-
     av_log(avctx, AV_LOG_INFO, "VTDecompressionSessionWaitForAsynchronousFrames OSStatus: %d\n", status);
 }
 
@@ -332,7 +370,7 @@ static int copy_cvpixelbuffer(AVCodecContext *avctx, CVPixelBufferRef image_buff
 }
 
 
-static void process_nalu(AVCodecContext *avctx, NALU *nalu, AVPacket *avpkt) {
+static bool process_nalu(AVCodecContext *avctx, NALU *nalu, AVPacket *avpkt) {
     H264VideotoolboxContext *context = avctx->priv_data;
 
     switch (nalu->type) {
@@ -350,21 +388,45 @@ static void process_nalu(AVCodecContext *avctx, NALU *nalu, AVPacket *avpkt) {
         }
         case 1:
         case 5: {
+            if (!context->first_decodable_nalu) {
+                context->first_decodable_nalu = nalu;
+            }
+
+            NALU *next_nalu = nalu->next;
+            if (next_nalu && (next_nalu->type == 1  || next_nalu->type == 5)) {
+                return true;
+            }
+
+            if (next_nalu && !(next_nalu->type == 1 || next_nalu->type == 5)) {
+                av_log(avctx, AV_LOG_WARNING, "Trailing NAL units after data NAL block; type %d", next_nalu->type);
+            }
+
             if (context->decompressionSession == NULL) {
                 create_decompression_session(avctx);
             }
 
-            int block_length = context->nalu_length_size + nalu->data_size;
+            //all next nal units should be given to decompressor as one chunk
+            int block_length = nalu->ptr + nalu->size - context->first_decodable_nalu->data_ptr + context->nalu_length_size;
             uint8_t *data = data = malloc(block_length);
 
             if (context->is_avc) {
-                data = memcpy(data, nalu->ptr, nalu->size);
+                data = memcpy(data, context->first_decodable_nalu->ptr, block_length);
             }
             else {
-                memcpy(&data[context->nalu_length_size], nalu->data_ptr, nalu->data_size);
+                //
+                memcpy(&data[context->nalu_length_size], context->first_decodable_nalu->data_ptr, block_length - context->first_decodable_nalu->delimeter_size);
                 uint32_t dataLength32 = htonl(nalu->data_size);
                 memcpy(data, &dataLength32, sizeof (uint32_t));
             }
+
+            //  av_log(avctx, AV_LOG_INFO, "Decompress nalu of length %d beginning with bytes %02X%02X%02X%02X %02X%02X\n",
+            //     (int) block_length,
+            //     (int) data[0],
+            //     (int) data[1],
+            //     (int) data[2],
+            //     (int) data[3],
+            //     (int) data[4],
+            //     (int) data[5]);
 
             CMSampleBufferRef sampleBuffer = NULL;
             CMBlockBufferRef blockBuffer = NULL;
@@ -411,7 +473,7 @@ static void process_nalu(AVCodecContext *avctx, NALU *nalu, AVPacket *avpkt) {
                 // CFMutableDictionaryRef dict = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
                 // CFDictionarySetValue(dict, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
 
-                decompress(avctx, sampleBuffer);
+                decompress_sample_buffer(avctx, sampleBuffer);
                 CFRelease(sampleBuffer);
             }
 
@@ -424,20 +486,24 @@ static void process_nalu(AVCodecContext *avctx, NALU *nalu, AVPacket *avpkt) {
                 CFRelease(blockBuffer);
             }
 
+            return false;
             break;
         }
         default:
             av_log(avctx, AV_LOG_INFO, "Unhadnled nalu od type:%d\n", nalu->type);
         break;
     }
+    return true;
 }
 
 
 static av_cold int h264_videotoolbox_decode_init(AVCodecContext *avctx) {
     H264VideotoolboxContext *ctx = avctx->priv_data;
-    ctx->pixbuf = 0;
-    ctx->avc_type_parsed = false;
-    ctx->formatDescription = NULL;
+    memset(ctx, 0, sizeof(H264VideotoolboxContext));
+
+    ctx->nalu_length_size = 4;
+
+    TAILQ_INIT(&ctx->decoded_frames);
 
     avctx->pix_fmt = AV_PIX_FMT_YUV420P;
 
@@ -489,11 +555,16 @@ static av_cold int h264_videotoolbox_decode_end(AVCodecContext *avctx) {
     set_sps(ctx, 0, 0);
     set_pps(ctx, 0, 0);
 
+    DecodedFrame *frame = NULL;
+    while ((frame = TAILQ_FIRST(&ctx->decoded_frames))) {
+        TAILQ_REMOVE(&ctx->decoded_frames, frame, entries);
+        free(frame);
+    }
+
     return ret;
 }
 
 
-//int (*decode)(AVCodecContext *, void *outdata, int *outdata_size, AVPacket *avpkt);
 static int h264_videotoolbox_decode_frame(AVCodecContext *avctx, void *outdata,
                              int *got_frame, AVPacket *avpkt) {
     H264VideotoolboxContext *context = avctx->priv_data;
@@ -506,73 +577,87 @@ static int h264_videotoolbox_decode_frame(AVCodecContext *avctx, void *outdata,
         VTDecompressionSessionFinishDelayedFrames(context->decompressionSession);
         //TODO: flush decompressor? repeat frame?
     }
-
-    if (frame_size < 4) {
-        av_log(avctx, AV_LOG_WARNING, "Got packet of length %d.\n", (int) avpkt->size);
+    else if (frame_size < 4) {
+        av_log(avctx, AV_LOG_WARNING, "Got packet of length %d.\n", (int)avpkt->size);
         return 0;
     }
 
     if (avpkt->size < 6) {
-         av_log(avctx, AV_LOG_INFO, "Got packet of length %d.\n", (int) avpkt->size);
-     } 
-     else {
-         av_log(avctx, AV_LOG_INFO, "Got packet of length %d beginning with bytes %02X%02X%02X%02X %02X%02X\n",
-                (int) avpkt->size,
-                (int) avpkt->data[0],
-                (int) avpkt->data[1],
-                (int) avpkt->data[2],
-                (int) avpkt->data[3],
-                (int) avpkt->data[4],
-                (int) avpkt->data[5]);
-    } 
-    av_log(avctx, AV_LOG_INFO, "packet pts %lld.\n", avpkt->pts);
-
-    parse_avc_type(context, frame); //Annex B or AVC
-
-    NALU *first_nalu = build_nalu_list(context, frame, frame_size);
-
-    NALU *current_nalu = first_nalu;
-    do {
-        av_log(avctx, AV_LOG_INFO, "~~~~~~~ Processing NALU Type \"%d\" ~~~~~~~~\n", current_nalu->type);
-        process_nalu(avctx, current_nalu, avpkt);
-    } while (current_nalu = current_nalu->next);
-
-    if (first_nalu) {
-        free_nalu_list(first_nalu);
+        av_log(avctx, AV_LOG_INFO, "Got packet of length %d.\n", (int)avpkt->size);
+    }
+    else {
+        av_log(avctx, AV_LOG_INFO, "Got packet of length %d beginning with bytes %02X%02X%02X%02X %02X%02X\n",
+               (int)avpkt->size,
+               (int)avpkt->data[0],
+               (int)avpkt->data[1],
+               (int)avpkt->data[2],
+               (int)avpkt->data[3],
+               (int)avpkt->data[4],
+               (int)avpkt->data[5]);
     }
 
-     if (!context->pixbuf) {
-         //decoder has accepted our input data, but no output frame is available so far
+    av_log(avctx, AV_LOG_INFO, "packet pts %lld.\n", avpkt->pts);
+
+    if (frame_size > 0) {
+        parse_avc_type(context, frame);  //Annex B or AVC
+
+        NALU* first_nalu = build_nalu_list(context, frame, frame_size);
+
+        NALU* current_nalu = first_nalu;
+
+        bool should_continue = false;
+        do {
+            av_log(avctx, AV_LOG_INFO, "~~~~~~~ Processing NALU Type \"%d\" data_size %d~~~~~~~~\n", current_nalu->type, current_nalu->data_size);
+            should_continue = process_nalu(avctx, current_nalu, avpkt);
+        } while ((current_nalu = current_nalu->next) && should_continue);
+
+        context->first_decodable_nalu = NULL;
+        if (first_nalu) {
+            free_nalu_list(first_nalu);
+        }
+        
+        add_decoded_frame_to_queue(context, context->pixbuf, context->pts, context->duration);
+        set_pixbuffer(context, NULL);
+    }
+
+    // VTDecompressionSessionWaitForAsynchronousFrames(context->decompressionSession);
+
+     //if (!context->pixbuf) {
+    if (TAILQ_EMPTY(&context->decoded_frames)) {
          av_log(avctx, AV_LOG_WARNING, "Empty pixbuf: return\n");
          return avpkt->size;
-     }
+    }
 
-     if (ff_get_buffer(avctx, avframe, 0) < 0) {
-         av_log(avctx, AV_LOG_ERROR, "Unable to allocate buffer\n");
-         return 0;//AVERROR(ENOMEM);
-     }
+    DecodedFrame *decoded_frame = TAILQ_FIRST(&context->decoded_frames);
+    CVPixelBufferRef pixbuf = decoded_frame->pixbuf;
 
-    int width = CVPixelBufferGetWidth(context->pixbuf);
-    int height = CVPixelBufferGetHeight(context->pixbuf);
-    int numberOfPlanes = CVPixelBufferGetPlaneCount(context->pixbuf);
+    if (ff_get_buffer(avctx, avframe, 0) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Unable to allocate buffer\n");
+        return 0;  //AVERROR(ENOMEM);
+    }
 
-    av_log(avctx, AV_LOG_INFO, "ctx->pixbuf %ld:(%dx%d) planes:%d\n", (long int)context->pixbuf, width, height, numberOfPlanes);
+    int width = CVPixelBufferGetWidth(pixbuf);
+    int height = CVPixelBufferGetHeight(pixbuf);
+    int numberOfPlanes = CVPixelBufferGetPlaneCount(pixbuf);
+
+    av_log(avctx, AV_LOG_INFO, "return pixbuf %p:(%dx%d) planes:%d\n", pixbuf, width, height, numberOfPlanes);
+    av_log(avctx, AV_LOG_INFO, "rerurn pts %lld\n", decoded_frame->pts);
 
     int ret = ff_set_dimensions(avctx, width, height);
     av_log(avctx, AV_LOG_INFO, "ff_set_dimensions:%d\n", ret);
 
-    copy_cvpixelbuffer(avctx, context->pixbuf, avframe);
-    CVPixelBufferRelease(context->pixbuf);
+    copy_cvpixelbuffer(avctx, pixbuf, avframe);
+    CVPixelBufferRelease(pixbuf);
 
-    av_log(avctx, AV_LOG_INFO, "avctx->reordered_opaque %lld\n", avctx->reordered_opaque);
-    av_log(avctx, AV_LOG_INFO, "avpkt->pts %lld\n", avpkt->pts);
-    av_log(avctx, AV_LOG_INFO, "avpkt->dts %lld\n", avpkt->dts);
-    av_log(avctx, AV_LOG_INFO, "avpkt->duration %lld\n", avpkt->duration);
+    // av_log(avctx, AV_LOG_INFO, "avctx->reordered_opaque %lld\n", avctx->reordered_opaque);
+    // av_log(avctx, AV_LOG_INFO, "avpkt->pts %lld\n", avpkt->pts);
+    // av_log(avctx, AV_LOG_INFO, "avpkt->dts %lld\n", avpkt->dts);
+    // av_log(avctx, AV_LOG_INFO, "avpkt->duration %lld\n", avpkt->duration);
 
     //avframe->pkt_dts = AV_NOPTS_VALUE;
-    avframe->pts = avpkt->pts;
+    avframe->pts = decoded_frame->pts;
  //   avframe->pts = context->pts;
-    avframe->reordered_opaque = avpkt->pts;
+    avframe->reordered_opaque = decoded_frame->pts;
     //avframe->pkt_duration = context->duration;
     //avframe->pkt_dts = context->dts;
 
@@ -583,9 +668,12 @@ static int h264_videotoolbox_decode_frame(AVCodecContext *avctx, void *outdata,
      // I don't know why this thing is needed:
  #if FF_API_PKT_PTS
  FF_DISABLE_DEPRECATION_WARNINGS
-     avframe->pkt_pts = avpkt->pts;
+     avframe->pkt_pts = decoded_frame->pts;
  FF_ENABLE_DEPRECATION_WARNINGS
  #endif
+
+    TAILQ_REMOVE(&context->decoded_frames, decoded_frame, entries);
+    free(decoded_frame);
 
     av_log(avctx, AV_LOG_INFO, "~~~~~~~Frame decoded~~~~~~~~\n\n");
 
@@ -595,8 +683,8 @@ static int h264_videotoolbox_decode_frame(AVCodecContext *avctx, void *outdata,
 
 
 AVCodec ff_h264_videotoolbox_decoder = {
-    .name                  = "h264",
-    .long_name             = NULL_IF_CONFIG_SMALL("H.264 Decodeer with videotoolbox"),
+    .name                  = "h264vt",
+    .long_name             = NULL_IF_CONFIG_SMALL("H.264 Decoder with videotoolbox"),
     .type                  = AVMEDIA_TYPE_VIDEO,
     .id                    = AV_CODEC_ID_H264,
     .priv_data_size        = sizeof(H264VideotoolboxContext),
@@ -614,6 +702,6 @@ AVCodec ff_h264_videotoolbox_decoder = {
     // .update_thread_context = ONLY_IF_THREADS_ENABLED(ff_h264_update_thread_context),
     // .profiles              = NULL_IF_CONFIG_SMALL(ff_h264_profiles),
     // .priv_class            = &h264_class,
- //   .bsfs           = "h264_mp4toannexb",
+    //.bsfs           = "h264_mp4toannexb",
     .wrapper_name   = "h264_videotoolbox",
 };
