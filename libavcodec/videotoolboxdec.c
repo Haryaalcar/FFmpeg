@@ -11,7 +11,6 @@
 #include <sys/queue.h>
 
 //TODO: key frames?
-//TODO: multi sps/pps in extradata
 
 typedef struct DecodedFrame {
     CVPixelBufferRef pixbuf;
@@ -35,10 +34,6 @@ typedef struct H264VideotoolboxContext {
     uint8_t* sps;
     uint8_t* pps;
 
-    // CVPixelBufferRef pixbuf;
-    // int64_t pts;
-    // int64_t duration;
-
     int64_t last_returned_pts;
 
     TAILQ_HEAD(DF, DecodedFrame) decoded_frames;
@@ -48,7 +43,9 @@ typedef struct H264VideotoolboxContext {
 } H264VideotoolboxContext;
 
 
-static void add_decoded_frame_to_queue(H264VideotoolboxContext *context, CVPixelBufferRef pixbuf, int64_t pts, int64_t duration) {
+static void add_decoded_frame_to_queue(AVCodecContext *avctx, CVPixelBufferRef pixbuf, int64_t pts, int64_t duration) {
+    H264VideotoolboxContext *context = avctx->priv_data;
+
     DecodedFrame *decoded_frame = (DecodedFrame *)malloc(sizeof(DecodedFrame));
     
     decoded_frame->pixbuf = CVPixelBufferRetain(pixbuf);
@@ -71,10 +68,10 @@ static void add_decoded_frame_to_queue(H264VideotoolboxContext *context, CVPixel
     }
 
     {
-        av_log(NULL, AV_LOG_INFO, "decoded frames queue:\n");
+        av_log(avctx, AV_LOG_INFO, "decoded frames queue:\n");
         DecodedFrame* frame = NULL;
         TAILQ_FOREACH(frame, &context->decoded_frames, entries) {
-            av_log(NULL, AV_LOG_INFO, "pts: %lld\n", frame->pts);
+            av_log(avctx, AV_LOG_INFO, "pts: %lld\n", frame->pts);
         }
     }
     context->decoded_frames_count++;
@@ -261,7 +258,6 @@ static void decompressionSessionDecodeFrameCallback(void* decompressionOutputRef
                                                     CMTime presentationTimeStamp,
                                                     CMTime presentationDuration) {
     AVCodecContext* avctx = decompressionOutputRefCon;
-    H264VideotoolboxContext *context = avctx->priv_data;
 
     if (status != noErr) {
         CFErrorRef error = CFErrorCreate(NULL, kCFErrorDomainOSStatus, status, NULL);
@@ -273,7 +269,7 @@ static void decompressionSessionDecodeFrameCallback(void* decompressionOutputRef
     else {
         av_log(avctx, AV_LOG_INFO, "Decompressed sucessfully, PTS: %lld,  img %p\n", presentationTimeStamp.value, imageBuffer);
 
-        add_decoded_frame_to_queue(context, imageBuffer, presentationTimeStamp.value, presentationDuration.value);
+        add_decoded_frame_to_queue(avctx, imageBuffer, presentationTimeStamp.value, presentationDuration.value);
     }
 }
 
@@ -530,17 +526,26 @@ static av_cold int h264_videotoolbox_decode_init(AVCodecContext *avctx) {
 
             int number_of_sps_nalus = avctx->extradata[5] & 31; //5 bits
             if (number_of_sps_nalus > 1) {
-                av_log(avctx, AV_LOG_INFO, "Should handle multiple sps: %d\n", (int)number_of_sps_nalus);
-                assert(false);
+                av_log(avctx, AV_LOG_WARNING, "Multiple sps in extradata: %d\n", (int)number_of_sps_nalus);
             }
-            int sps_size = (avctx->extradata[6] << 8) + avctx->extradata[7];
-            uint8_t *sps_ptr = &avctx->extradata[8];
+
+            int sps_size = 0;
+            uint8_t *sps_ptr = NULL;
+            int sps_offset = 0;
+
+            //last sps will remain
+            for (int i = 0; i < number_of_sps_nalus; i++) {
+                sps_size = (avctx->extradata[6 + sps_offset] << 8) + avctx->extradata[7 + sps_offset];
+                sps_ptr = &avctx->extradata[8 + sps_offset];
+                sps_offset += sps_size;
+            }
 
             int number_of_pps_nalus = *(sps_ptr + sps_size);
             if (number_of_pps_nalus > 1) {
-                av_log(avctx, AV_LOG_INFO, "Should handle multiple pps: %d\n", (int)number_of_pps_nalus);
-                assert(false);
+                av_log(avctx, AV_LOG_WARNING, "Should handle multiple pps: %d\n", (int)number_of_pps_nalus);
             }
+
+            //take first pps
             uint8_t* pps_size_ptr = sps_ptr + sps_size + 1;
             int pps_size = (pps_size_ptr[0] << 8) + pps_size_ptr[1];
             uint8_t *pps_ptr = pps_size_ptr + 2;
@@ -604,11 +609,16 @@ static int h264_videotoolbox_decode_frame(AVCodecContext* avctx, void* outdata, 
                (int)avpkt->data[5]);
     }
 
-    av_log(avctx, AV_LOG_INFO, "packet pts %lld.\n", avpkt->pts);
+    if (avpkt->side_data_elems) {
+        av_log(avctx, AV_LOG_INFO, "avpkt->side_data_elems %d\n", avpkt->side_data_elems);
+    }
+
+    av_log(avctx, AV_LOG_INFO, "packet pts %lld. avpkt->stream_index %lld\n", avpkt->pts, (long long)avpkt->stream_index);
+    av_log(avctx, AV_LOG_INFO, "avctx->reordered_opaque %lld\n", avctx->reordered_opaque);
 
     //Input processing
 
-    if (frame_size > 0) {
+    if (frame_size > 0) {   
         parse_avc_type(context, frame);  //Annex B or AVC
 
         NALU* first_nalu = build_nalu_list(context, frame, frame_size);
@@ -620,7 +630,10 @@ static int h264_videotoolbox_decode_frame(AVCodecContext* avctx, void* outdata, 
         NALU* current_nalu = first_nalu;
 
         while (current_nalu && !current_nalu->is_decodable) {
-            av_log(avctx, AV_LOG_INFO, "~~~~~~~ Processing NALU Type \"%d\" data_size %d~~~~~~~~\n", current_nalu->type, current_nalu->data_size);
+            av_log(avctx, AV_LOG_INFO, "~~~~~~~ Processing NALU Type \"%d\" data_size %d :%02X %02X~~~~~~~~\n", current_nalu->type,
+                   current_nalu->data_size,
+                   current_nalu->data_ptr[0],
+                   current_nalu->data_ptr[1]);
             process_metainfo_nalu(avctx, current_nalu, avpkt);
             current_nalu = current_nalu->next;
         }
