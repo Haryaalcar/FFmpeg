@@ -566,10 +566,8 @@ static av_cold int h264_videotoolbox_decode_end(AVCodecContext *avctx) {
     set_sps(context, 0, 0);
     set_pps(context, 0, 0);
 
-    DecodedFrame *frame = NULL;
-    while ((frame = TAILQ_FIRST(&context->decoded_frames))) {
-        TAILQ_REMOVE(&context->decoded_frames, frame, entries);
-        free(frame);
+    while (TAILQ_FIRST(&context->decoded_frames)) {
+        drop_decoded_frame_queue_head(context);
     }
     context->decoded_frames_count = 0;
 
@@ -679,6 +677,19 @@ static int h264_videotoolbox_decode_frame(AVCodecContext* avctx, void* outdata, 
 }
 
 
+static void h264_videotoolbox_flush(AVCodecContext *avctx) {
+    H264VideotoolboxContext* context = avctx->priv_data;
+    av_log(avctx, AV_LOG_INFO, "h264_videotoolbox_flush\n");
+
+    //drop reorder queue after seek
+    while (TAILQ_FIRST(&context->decoded_frames)) {
+        drop_decoded_frame_queue_head(context);
+    }
+    context->decoded_frames_count = 0;
+    context->last_returned_pts = 0;
+}
+
+
 AVCodec ff_h264_videotoolbox_decoder = {
     .name                  = "h264vt",
     .long_name             = NULL_IF_CONFIG_SMALL("H.264 Decoder with videotoolbox"),
@@ -688,8 +699,9 @@ AVCodec ff_h264_videotoolbox_decoder = {
     .init                  = h264_videotoolbox_decode_init,
     .close                 = h264_videotoolbox_decode_end,
     .decode                = h264_videotoolbox_decode_frame,
+    .flush                 = h264_videotoolbox_flush,
     .capabilities          = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY ,
     .caps_internal         = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_EXPORTS_CROPPING,
-    .bsfs           = "h264_mp4toannexb",
+    //.bsfs           = "h264_mp4toannexb",
     .wrapper_name   = "h264_videotoolbox",
 };
