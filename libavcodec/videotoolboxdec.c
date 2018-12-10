@@ -491,6 +491,7 @@ static void process_metainfo_nalu(AVCodecContext *avctx, NALU *nalu, AVPacket *a
         case 8: { //PPS
             set_pps(context, nalu->data_ptr, nalu->size);
             create_format_description(avctx);
+            create_decompression_session(avctx);
             break;
         }
         case 1:
