@@ -121,6 +121,7 @@ typedef struct NALU {
     const uint8_t* data_ptr;
     int type;
     int size;
+    int nri;
     int data_size;
     int delimeter_size;
     bool is_incomplete; //for avc only can detect
@@ -146,6 +147,7 @@ static NALU * create_NALU(H264VideotoolboxContext *context, const uint8_t* frame
         nalu->size = context->nalu_length_size + nalu_data_size;
         nalu->data_size = nalu_data_size;
         nalu->type = frame[context->nalu_length_size] & 0x1F;
+        nalu->nri = (frame[context->nalu_length_size] & 0x60) >> 5;
         nalu->delimeter_size = context->nalu_length_size;
         nalu->is_incomplete = max_length < nalu->size;
         nalu->ptr = frame;
@@ -178,6 +180,7 @@ static NALU * create_NALU(H264VideotoolboxContext *context, const uint8_t* frame
         nalu->size = annexb_delimeter_size + nalu_data_size;
         nalu->data_size = nalu_data_size;
         nalu->type = frame[annexb_delimeter_size] & 0x1F;
+        nalu->nri = (frame[annexb_delimeter_size] & 0x60) >> 5;
         nalu->delimeter_size = annexb_delimeter_size;
         nalu->is_incomplete = (max_length < annexb_delimeter_size + 2); //cannot determine as for avc
         nalu->ptr = frame;
@@ -244,9 +247,8 @@ static void create_format_description(AVCodecContext *avctx) {
                                                                           4,
                                                                           &context->format_description);
 
-    if(status != noErr) {
-        av_log(avctx, AV_LOG_INFO, "\t\t Failed to create format Description: OSStatus: %d\n", (int)status);
-    }
+    int level = (status == noErr) ? AV_LOG_INFO : AV_LOG_ERROR;
+    av_log(avctx, level, "\t\t Create format Description: OSStatus: %d\n", (int)status);
 }
 
 
