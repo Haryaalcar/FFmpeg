@@ -10,6 +10,9 @@
 #include "internal.h"
 #include <sys/queue.h>
 
+#include "bs.h"
+
+
 //TODO: key frames?
 
 typedef struct DecodedFrame {
@@ -34,7 +37,13 @@ typedef struct H264VideotoolboxContext {
     uint8_t* sps;
     uint8_t* pps;
 
-    int64_t last_returned_pts;
+    bool pic_order_based_reordering;
+    int sps_max_pic_order_cnt_lsb;
+    int sps_pic_order_cnt_type;
+    int sps_max_frame_num;
+    int sps_frame_mbs_only_flag;
+
+    int64_t last_returned_reorder_value;
 
     TAILQ_HEAD(DF, DecodedFrame) decoded_frames;
     int decoded_frames_count;
@@ -89,6 +98,8 @@ static void drop_decoded_frame_queue_head(H264VideotoolboxContext *context) {
 }
 
 
+static int parse_sps(H264VideotoolboxContext *context);
+
 static void set_sps(H264VideotoolboxContext *context, const uint8_t* sps, int sps_size) {
     if (context->sps) {
         free(context->sps);
@@ -100,7 +111,9 @@ static void set_sps(H264VideotoolboxContext *context, const uint8_t* sps, int sp
         context->sps = malloc(sps_size);
         memcpy(context->sps, sps, sps_size);
     }
+    parse_sps(context);
 }
+
 
 static void set_pps(H264VideotoolboxContext *context, const uint8_t* pps, int pps_size) {
     if (context->pps) {
@@ -114,6 +127,7 @@ static void set_pps(H264VideotoolboxContext *context, const uint8_t* pps, int pp
         memcpy(context->pps, pps, pps_size);
     }
 }
+
 
 
 typedef struct NALU {
@@ -207,6 +221,82 @@ static NALU *build_nalu_list(H264VideotoolboxContext *context, const uint8_t* fr
 
 static void free_nalu_list(NALU *nalu) {
     nalu->next ? free_nalu_list(nalu->next) : free(nalu);
+}
+
+
+static int parse_sps(H264VideotoolboxContext *context) {
+    bs_t* b = 0;
+    if ((b = bs_new(context->sps, context->sps_size)) == NULL) {
+        return -1;
+    }
+
+    bs_skip_u(b, 8);
+    int profile_idc = bs_read_u8(b);
+    bs_skip_u(b, 8);
+    __unused int level_idc = bs_read_u8(b);
+    __unused int sps_id = bs_read_ue(b);
+
+    if (profile_idc == 100 || profile_idc == 110 || profile_idc == 122 || profile_idc == 144) {
+        av_log(NULL, AV_LOG_ERROR, "chroma not handled");
+        //TODO: chroma skip
+
+        bs_free(b);
+        return -1;
+    }
+
+    context->sps_max_frame_num = bs_read_ue(b) + 4;
+    context->sps_pic_order_cnt_type = bs_read_ue(b);
+    if (context->sps_pic_order_cnt_type == 0) {
+        int log2_max_pic_order_cnt_lsb_minus4 = bs_read_ue(b); //!
+        //return log2_max_pic_order_cnt_lsb_minus4 + 4;
+        context->sps_max_pic_order_cnt_lsb = log2_max_pic_order_cnt_lsb_minus4 + 4;
+    }
+    else if (context->sps_pic_order_cnt_type == 1) {
+        bs_skip_u(b, 1);
+        bs_skip_u(b, 32);
+        bs_skip_u(b, 32);
+        int num_ref_frames_in_pocc = bs_read_ue(b);
+        bs_skip_u(b, 32 * num_ref_frames_in_pocc);
+    }
+    __unused int num_ref_frames = bs_read_ue(b);
+    __unused int gaps = bs_read_u1(b);
+    __unused int p_w = bs_read_ue(b);
+    __unused int p_h = bs_read_ue(b);
+    context->sps_frame_mbs_only_flag = bs_read_u1(b);
+
+    bs_free(b);
+    return 0;
+}
+
+
+static int parse_pic_order_cnt_lsb(H264VideotoolboxContext *context, NALU* nalu) {
+    bs_t* b = 0;
+    if ((b = bs_new((uint8_t*)nalu->data_ptr, nalu->data_size)) == NULL) {
+        return -1;
+    }
+
+    bs_skip_u(b, 8);
+    __unused int first_mb_slice = bs_read_ue(b);
+    __unused int slyce_type = bs_read_ue(b);
+    __unused int pps_id = bs_read_ue(b);
+    __unused int frame_num = bs_read_u(b, context->sps_max_frame_num);
+
+    if (!context->sps_frame_mbs_only_flag) {
+        av_log(NULL, AV_LOG_ERROR, "not handled\n");
+    }
+
+    if (nalu->type == 5) {
+        __unused int idr_pic_id = bs_read_ue(b);
+    }
+
+    if (context->sps_pic_order_cnt_type == 0) {
+        int pic_order_cnt_lsb = bs_read_u(b, context->sps_max_pic_order_cnt_lsb);
+        bs_free(b);
+        return pic_order_cnt_lsb;
+    }
+
+    bs_free(b);
+    return -1;
 }
 
 
@@ -386,7 +476,7 @@ static int copy_cvpixelbuffer(AVCodecContext *avctx, CVPixelBufferRef image_buff
 
 
 //sends decodable NAL units data to decoder
-static void decode_nalu(AVCodecContext *avctx, NALU* nalu, AVPacket *avpkt) {
+static void decode_nalu(AVCodecContext *avctx, NALU* nalu, uint64_t reordering_increment_value) {
     H264VideotoolboxContext *context = avctx->priv_data;
 
     int decode_data_size = 0;
@@ -400,7 +490,7 @@ static void decode_nalu(AVCodecContext *avctx, NALU* nalu, AVPacket *avpkt) {
         av_log(avctx, AV_LOG_WARNING, "Trailing NAL units after data NAL block; type %d", current_nalu->type);
     }
 
-    uint8_t *data = data = malloc(decode_data_size);
+    uint8_t *data = malloc(decode_data_size);
 
     if (context->is_avc) {
         memcpy(data, nalu->ptr, decode_data_size);
@@ -432,13 +522,15 @@ static void decode_nalu(AVCodecContext *avctx, NALU* nalu, AVPacket *avpkt) {
                                                 decode_data_size,
                                                 0, &blockBuffer);
 
-    av_log(avctx, AV_LOG_INFO, "\t\t BlockBufferCreation: \t %s\n", (status == kCMBlockBufferNoErr) ? "successful!" : "failed...");
+    if (status != kCMBlockBufferNoErr) {
+        av_log(avctx, AV_LOG_ERROR, "\t\t BlockBufferCreation: failed with OSStatus %d ", status);
+    }
 
     if (blockBuffer && status == noErr) {
         CMSampleTimingInfo timeInfoArray[1] = {{
-            .duration = CMTimeMake(avpkt->duration, 1),
-            .presentationTimeStamp = CMTimeMake(avpkt->pts, 1),
-            .decodeTimeStamp = CMTimeMake(avpkt->dts, 1),
+            .duration = kCMTimeInvalid,
+            .presentationTimeStamp = CMTimeMake(reordering_increment_value, 1),
+            .decodeTimeStamp = kCMTimeInvalid,
         }};
 
         status = CMSampleBufferCreate(kCFAllocatorDefault,
@@ -480,7 +572,7 @@ static void decode_nalu(AVCodecContext *avctx, NALU* nalu, AVPacket *avpkt) {
 }
 
 
-static void process_metainfo_nalu(AVCodecContext *avctx, NALU *nalu, AVPacket *avpkt) {
+static void process_metainfo_nalu(AVCodecContext *avctx, NALU *nalu) {
     H264VideotoolboxContext *context = avctx->priv_data;
 
     switch (nalu->type) {
@@ -590,6 +682,10 @@ static int h264_videotoolbox_decode_frame(AVCodecContext* avctx, void* outdata, 
     uint8_t* frame = avpkt->data;
     int frame_size = avpkt->size;
 
+    if (avpkt->pts == AV_NOPTS_VALUE) {
+        context->pic_order_based_reordering = true;
+    }
+
     if (frame_size == 0) {
         VTDecompressionSessionFinishDelayedFrames(context->decompression_session);
     }
@@ -616,8 +712,7 @@ static int h264_videotoolbox_decode_frame(AVCodecContext* avctx, void* outdata, 
         av_log(avctx, AV_LOG_INFO, "avpkt->side_data_elems %d\n", avpkt->side_data_elems);
     }
 
-    av_log(avctx, AV_LOG_INFO, "packet pts %lld. avpkt->stream_index %lld\n", avpkt->pts, (long long)avpkt->stream_index);
-    av_log(avctx, AV_LOG_INFO, "avctx->reordered_opaque %lld\n", avctx->reordered_opaque);
+    av_log(avctx, AV_LOG_INFO, "packet pts %lld avctx->reordered_opaque %lld\n", avpkt->pts, avctx->reordered_opaque);
 
     //Input processing
 
@@ -637,12 +732,31 @@ static int h264_videotoolbox_decode_frame(AVCodecContext* avctx, void* outdata, 
                    current_nalu->data_size,
                    current_nalu->data_ptr[0],
                    current_nalu->data_ptr[1]);
-            process_metainfo_nalu(avctx, current_nalu, avpkt);
+            process_metainfo_nalu(avctx, current_nalu);
             current_nalu = current_nalu->next;
         }
 
         if (current_nalu) {
-            decode_nalu(avctx, current_nalu, avpkt);
+            uint64_t reordering_value = avpkt->pts;
+
+            if (context->pic_order_based_reordering) {
+                static uint64_t max_pic_order = 0;
+                static uint64_t reordering_increment_value = -1;
+
+                int pic_order = parse_pic_order_cnt_lsb(context, current_nalu);
+                max_pic_order = MAX(pic_order, max_pic_order);
+
+                if (current_nalu->type == 5) {
+                    reordering_increment_value += max_pic_order;
+                    reordering_increment_value ++;
+                    max_pic_order = 0;
+                }
+
+                av_log(avctx, AV_LOG_INFO, "parsed pic order is %d reordering_increment_value %llu\n", pic_order, reordering_increment_value);
+                reordering_value = pic_order + reordering_increment_value;
+            }
+
+            decode_nalu(avctx, current_nalu, reordering_value);
         }
 
         free_nalu_list(first_nalu);
@@ -666,7 +780,9 @@ static int h264_videotoolbox_decode_frame(AVCodecContext* avctx, void* outdata, 
     av_log(avctx, AV_LOG_INFO, "return pts %lld\n", decoded_frame->pts);
 
     int ret = ff_set_dimensions(avctx, width, height);
-    av_log(avctx, AV_LOG_INFO, "ff_set_dimensions:%d\n", ret);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_INFO, "ff_set_dimensions:%d\n", ret);
+    }
 
     if (ff_get_buffer(avctx, avframe, 0) < 0) {
         av_log(avctx, AV_LOG_ERROR, "Unable to allocate buffer\n");
@@ -675,13 +791,13 @@ static int h264_videotoolbox_decode_frame(AVCodecContext* avctx, void* outdata, 
 
     copy_cvpixelbuffer(avctx, pixbuf, avframe);
 
-    avframe->pts = decoded_frame->pts;
-    avframe->reordered_opaque = decoded_frame->pts;
+    avframe->pts = avpkt->pts;
+    avframe->reordered_opaque = avctx->reordered_opaque;    //pass chromium value
 
-    if (context->last_returned_pts > decoded_frame->pts) {
+    if (context->last_returned_reorder_value > decoded_frame->pts) {
         context->reorder_queue_size ++;
     }
-    context->last_returned_pts = avframe->pts;
+    context->last_returned_reorder_value = decoded_frame->pts;
 
     if (context->decoded_frames_count > context->reorder_queue_size || frame_size == 0) {
         drop_decoded_frame_queue_head(context);
@@ -702,7 +818,7 @@ static void h264_videotoolbox_flush(AVCodecContext *avctx) {
         drop_decoded_frame_queue_head(context);
     }
     context->decoded_frames_count = 0;
-    context->last_returned_pts = 0;
+    context->last_returned_reorder_value = 0;
 }
 
 
